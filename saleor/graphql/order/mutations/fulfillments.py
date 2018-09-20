@@ -6,7 +6,7 @@ from ....dashboard.order.utils import fulfill_order_line
 from ....order import OrderEvents, OrderEventsEmails, models
 from ....order.emails import send_fulfillment_confirmation
 from ....order.utils import cancel_fulfillment, update_order_status
-from ...core.mutations import BaseMutation, ModelMutation
+from ...core.mutations import BaseMutation
 from ...order.types import Fulfillment, Order
 from ...utils import get_nodes
 from ..types import OrderLine
@@ -54,7 +54,7 @@ class FulfillmentCancelInput(graphene.InputObjectType):
     restock = graphene.Boolean(description='Whether item lines are restocked.')
 
 
-class FulfillmentCreate(ModelMutation):
+class FulfillmentCreate(BaseMutation):
     fulfillment = graphene.Field(
         Fulfillment, description='A created fulfillment.')
     order = graphene.Field(
@@ -69,29 +69,26 @@ class FulfillmentCreate(ModelMutation):
 
     class Meta:
         description = 'Creates a new fulfillment for an order.'
-        model = models.Fulfillment
 
     @classmethod
     def clean_input(cls, info, instance, input, errors):
+        import pdb; pdb.set_trace()
         lines = input.pop('lines', None)
-        cleaned_input = super().clean_input(info, instance, input, errors)
-        if lines:
-            lines_ids = [line.get('order_line_id') for line in lines]
-            quantities = [line.get('quantity') for line in lines]
-            order_lines = get_nodes(
-                ids=lines_ids, graphene_type=OrderLine)
-            line_errors = clean_lines_quantities(order_lines, quantities)
-            if line_errors:
-                for err in line_errors:
-                    cls.add_error(errors, field=err[0], message=err[1])
-            else:
-                cleaned_input['order_lines'] = order_lines
-                cleaned_input['quantities'] = quantities
-        return cleaned_input
+        if not lines:
 
-    @classmethod
-    def user_is_allowed(cls, user, input):
-        return user.has_perm('order.manage_orders')
+        if not any(quantities):
+        lines_ids = [line['order_line_id'] for line in lines]
+        quantities = [line['quantity'] for line in lines]
+        order_lines = get_nodes(
+            ids=lines_ids, graphene_type=OrderLine)
+        line_errors = clean_lines_quantities(order_lines, quantities)
+        if line_errors:
+            for field, msg in line_errors:
+                cls.add_error(errors, field=field, message=msg)
+        else:
+            cleaned_input['order_lines'] = order_lines
+            cleaned_input['quantities'] = quantities
+        return cleaned_input
 
     @classmethod
     def construct_instance(cls, instance, cleaned_data):
@@ -109,16 +106,14 @@ class FulfillmentCreate(ModelMutation):
             lines_to_fulfill = [
                 (order_line, quantity) for order_line, quantity
                 in zip(order_lines, quantities) if quantity > 0]
-            for line in lines_to_fulfill:
-                order_line = line[0]
-                quantity = line[1]
+            for order_line, quantity in lines_to_fulfill:
                 fulfill_order_line(order_line, quantity)
                 quantity_fulfilled += quantity
             fulfillment_lines = [
                 models.FulfillmentLine(
-                    order_line=line[0],
-                    fulfillment=instance,
-                    quantity=line[1]) for line in lines_to_fulfill]
+                    order_line=order_line, fulfillment=instance,
+                    quantity=quantity)
+                for order_line, quantity in lines_to_fulfill]
             models.FulfillmentLine.objects.bulk_create(fulfillment_lines)
             update_order_status(order)
             order.events.create(
@@ -137,8 +132,21 @@ class FulfillmentCreate(ModelMutation):
                 user=info.context.user)
         return FulfillmentCreate(fulfillment=instance, order=order)
 
+    @classmethod
+    @permission_required('order.manage_orders')
+    def mutate(cls, root, info, order, input):
+        errors = []
+        order = cls.get_node_or_error(
+            info, order, errors, 'order', Order)
+        import pdb; pdb.set_trace()
+        if errors:
+            return cls(errors=errors)
+        fulfillment = models.Fulfillment(
+            tracking_number=input.pop('tracking_number'), order=order)
+        return FulfillmentCreate(fulfillment=fulfillment, order=order)
 
-class FulfillmentUpdateTracking(FulfillmentCreate):
+
+class FulfillmentUpdateTracking(BaseMutation):
     fulfillment = graphene.Field(
         Fulfillment, description='A fulfillment with updated tracking.')
     order = graphene.Field(
@@ -153,7 +161,26 @@ class FulfillmentUpdateTracking(FulfillmentCreate):
 
     class Meta:
         description = 'Updates a fulfillment for an order.'
-        model = models.Fulfillment
+
+    @classmethod
+    @permission_required('order.manage_orders')
+    def mutate(cls, root, info, id, input):
+        errors = []
+        fulfillment = cls.get_node_or_error(
+            info, id, errors, 'id', Fulfillment)
+        if errors:
+            return cls(errors=errors)
+        tracking_number = input.get('tracking_number')
+        fulfillment.tracking_number = input.get('tracking_number')
+        fulfillment.save()
+        order = fulfillment.order
+        order.events.create(
+            parameters={
+                'tracking_numner': tracking_number,
+                'fulfillment': fulfillment.composed_id},
+            type=OrderEvents.TRACKING_UPDATED.value,
+            user=info.context.user)
+        return FulfillmentUpdateTracking(fulfillment=fulfillment, order=order)
 
 
 class FulfillmentCancel(BaseMutation):
